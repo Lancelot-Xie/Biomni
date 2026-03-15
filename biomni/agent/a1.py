@@ -2679,13 +2679,92 @@ Each library is listed with its description to help you understand its functiona
         except ImportError:
             raise ImportError("Gradio is not installed. Please install it with: pip install gradio") from None
 
+        import json
         import os
+        import uuid
         from time import time
 
         # Define supported file extensions
         SUPPORTED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".pdf")
 
         self.main_history_copy = []
+
+        # --- Chat history storage setup ---
+        history_dir = os.path.join(os.path.expanduser("~"), ".biomni")
+        history_file = os.path.join(history_dir, "chat_history.jsonl")
+
+        def _serialize_message(msg):
+            """Convert a ChatMessage or dict to a JSON-serializable dict."""
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+                if not isinstance(content, str):
+                    content = str(content)
+                result = {"role": msg.get("role", "unknown"), "content": content}
+                metadata = msg.get("metadata")
+                if metadata:
+                    safe_meta = {}
+                    for k, v in metadata.items():
+                        try:
+                            json.dumps(v)
+                            safe_meta[k] = v
+                        except (TypeError, ValueError):
+                            safe_meta[k] = str(v)
+                    result["metadata"] = safe_meta
+                return result
+            elif isinstance(msg, ChatMessage):
+                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                result = {"role": msg.role, "content": content}
+                if msg.metadata:
+                    safe_meta = {}
+                    for k, v in msg.metadata.items():
+                        try:
+                            json.dumps(v)
+                            safe_meta[k] = v
+                        except (TypeError, ValueError):
+                            safe_meta[k] = str(v)
+                    result["metadata"] = safe_meta
+                return result
+            return {"role": "unknown", "content": str(msg)}
+
+        def _save_session(task_text, main_hist, inner_hist):
+            """Save a conversation session to the JSONL history file."""
+            os.makedirs(history_dir, exist_ok=True)
+            session = {
+                "session_id": str(uuid.uuid4()),
+                "timestamp": datetime.now().isoformat(),
+                "task": task_text[:200] if task_text else "",
+                "main_history": [_serialize_message(m) for m in (main_hist or [])],
+                "inner_history": [_serialize_message(m) for m in (inner_hist or [])],
+                "main_history_copy": list(self.main_history_copy),
+            }
+            with open(history_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(session, ensure_ascii=False) + "\n")
+
+        def _load_all_sessions():
+            """Load all saved sessions from the JSONL history file."""
+            if not os.path.exists(history_file):
+                return []
+            sessions = []
+            with open(history_file, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            sessions.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+            return sessions
+
+        def _get_history_choices():
+            """Return formatted (label, session_id) tuples for the history list."""
+            sessions = _load_all_sessions()
+            choices = []
+            for s in reversed(sessions):
+                ts = s.get("timestamp", "")[:19].replace("T", " ")
+                task = s.get("task", "Unknown")
+                task_short = (task[:50] + "...") if len(task) > 50 else task
+                choices.append((f"[{ts}] {task_short}", s["session_id"]))
+            return choices
 
         # Available access codes (if verification is required)
         available_access_codes = ["Biomni2025"]
@@ -2708,6 +2787,7 @@ Each library is listed with its description to help you understand its functiona
                 inner_history = []
             text_input = prompt_input.get("text", "")
             files = prompt_input.get("files", [])
+            original_task = text_input
 
             self.main_history_copy += [{"role": "user", "content": text_input}]
             main_history.append(ChatMessage(role="user", content=text_input if text_input else "[Uploaded file]"))
@@ -2997,9 +3077,47 @@ Each library is listed with its description to help you understand its functiona
             )
             yield inner_history, main_history
 
+            # Save conversation to history
+            try:
+                _save_session(original_task, main_history, inner_history)
+            except Exception as e:
+                print(f"Warning: Failed to save chat history: {e}")
+
         def like(data: gr.LikeData):
             print("User liked the response")
             print(f"Index: {data.index}, Liked: {data.liked}")
+
+        def on_select_history(session_id):
+            """Load a past session's conversation into the chatbots."""
+            if not session_id:
+                return [], []
+            sessions = _load_all_sessions()
+            for s in sessions:
+                if s.get("session_id") == session_id:
+                    main_hist = []
+                    for m in s.get("main_history", []):
+                        msg = {"role": m["role"], "content": m.get("content", "")}
+                        if m.get("metadata"):
+                            msg["metadata"] = m["metadata"]
+                        main_hist.append(msg)
+                    inner_hist = []
+                    for m in s.get("inner_history", []):
+                        msg = {"role": m["role"], "content": m.get("content", "")}
+                        if m.get("metadata"):
+                            msg["metadata"] = m["metadata"]
+                        inner_hist.append(msg)
+                    self.main_history_copy = list(s.get("main_history_copy", []))
+                    return inner_hist, main_hist
+            return [], []
+
+        def on_new_chat():
+            """Clear chatbots and start a fresh conversation."""
+            self.main_history_copy = []
+            return [], [], gr.Radio(value=None)
+
+        def refresh_history_list():
+            """Refresh the history radio choices after a new session is saved."""
+            return gr.Radio(choices=_get_history_choices())
 
         # Create the Gradio interface
         with gr.Blocks() as demo:
@@ -3022,7 +3140,17 @@ Each library is listed with its description to help you understand its functiona
             # Main interface
             with main_interface_container:
                 with gr.Row():
-                    with gr.Column(scale=1):
+                    # History sidebar
+                    with gr.Column(scale=1, min_width=200):
+                        gr.Markdown("### 📋 Chat History")
+                        new_chat_btn = gr.Button("➕ New Chat", variant="primary")
+                        history_radio = gr.Radio(
+                            choices=_get_history_choices(),
+                            label="Previous Sessions",
+                            interactive=True,
+                        )
+
+                    with gr.Column(scale=2):
                         main_chatbot = gr.Chatbot(
                             label="Biomni A1 Agent",
                             type="messages",
@@ -3030,7 +3158,7 @@ Each library is listed with its description to help you understand its functiona
                             show_copy_button=True,
                             show_share_button=True,
                         )
-                    with gr.Column(scale=1):
+                    with gr.Column(scale=2):
                         innerloop_chatbot = gr.Chatbot(
                             label="Biomni Executor",
                             type="messages",
@@ -3047,12 +3175,31 @@ Each library is listed with its description to help you understand its functiona
                         show_label=False,
                     )
 
-                # Bind submission
+                # Bind submission: generate → refresh history → clear input
                 prompt_input.submit(
                     generate_response,
                     [prompt_input, innerloop_chatbot, main_chatbot],
                     [innerloop_chatbot, main_chatbot],
+                ).then(
+                    refresh_history_list,
+                    None,
+                    [history_radio],
                 ).then(lambda: gr.MultimodalTextbox(value=None), None, [prompt_input])
+
+                # Bind history selection
+                history_radio.change(
+                    on_select_history,
+                    [history_radio],
+                    [innerloop_chatbot, main_chatbot],
+                )
+
+                # Bind new chat button
+                new_chat_btn.click(
+                    on_new_chat,
+                    None,
+                    [innerloop_chatbot, main_chatbot, history_radio],
+                )
+
                 main_chatbot.like(like)
 
         # Launch
