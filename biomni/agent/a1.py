@@ -2,6 +2,7 @@ import glob
 import inspect
 import os
 import re
+import traceback
 from collections.abc import Generator
 from datetime import datetime
 from pathlib import Path
@@ -1387,7 +1388,19 @@ Each library is listed with its description to help you understand its functiona
                 system_prompt += "\n\nIMPORTANT FOR GPT MODELS: You MUST use XML tags <execute> or <solution> in EVERY response. Do not use markdown code blocks (```) - use <execute> tags instead."
 
             messages = [SystemMessage(content=system_prompt)] + state["messages"]
-            response = self.llm.invoke(messages)
+            try:
+                response = self.llm.invoke(messages)
+            except Exception as e:
+                error_msg = f"LLM invocation failed: {str(e)}"
+                print(f"Generate node error: {error_msg}")
+                traceback.print_exc()
+                state["messages"].append(
+                    AIMessage(
+                        content=f"<solution>An error occurred while generating a response: {error_msg}. Please try again.</solution>"
+                    )
+                )
+                state["next_step"] = "end"
+                return state
 
             # Normalize Responses API content blocks (list of dicts) into a plain string
             content = response.content
@@ -1469,85 +1482,92 @@ Each library is listed with its description to help you understand its functiona
             return state
 
         def execute(state: AgentState) -> AgentState:
-            last_message = state["messages"][-1].content
-            # Only add the closing tag if it's not already there
-            if "<execute>" in last_message and "</execute>" not in last_message:
-                last_message += "</execute>"
+            try:
+                last_message = state["messages"][-1].content
+                # Only add the closing tag if it's not already there
+                if "<execute>" in last_message and "</execute>" not in last_message:
+                    last_message += "</execute>"
 
-            execute_match = re.search(r"<execute>(.*?)</execute>", last_message, re.DOTALL)
-            if execute_match:
-                code = execute_match.group(1)
+                execute_match = re.search(r"<execute>(.*?)</execute>", last_message, re.DOTALL)
+                if execute_match:
+                    code = execute_match.group(1)
 
-                # Set timeout duration (10 minutes = 600 seconds)
-                timeout = self.timeout_seconds
+                    # Set timeout duration (10 minutes = 600 seconds)
+                    timeout = self.timeout_seconds
 
-                # Check if the code is R code
-                if (
-                    code.strip().startswith("#!R")
-                    or code.strip().startswith("# R code")
-                    or code.strip().startswith("# R script")
-                ):
-                    # Remove the R marker and run as R code
-                    r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, count=1).strip()
-                    result = run_with_timeout(run_r_code, [r_code], timeout=timeout)
-                # Check if the code is a Bash script or CLI command
-                elif (
-                    code.strip().startswith("#!BASH")
-                    or code.strip().startswith("# Bash script")
-                    or code.strip().startswith("#!CLI")
-                ):
-                    # Handle both Bash scripts and CLI commands with the same function
-                    if code.strip().startswith("#!CLI"):
-                        # For CLI commands, extract the command and run it as a simple bash script
-                        cli_command = re.sub(r"^#!CLI", "", code, count=1).strip()
-                        # Remove any newlines to ensure it's a single command
-                        cli_command = cli_command.replace("\n", " ")
-                        result = run_with_timeout(run_bash_script, [cli_command], timeout=timeout)
+                    # Check if the code is R code
+                    if (
+                        code.strip().startswith("#!R")
+                        or code.strip().startswith("# R code")
+                        or code.strip().startswith("# R script")
+                    ):
+                        # Remove the R marker and run as R code
+                        r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, count=1).strip()
+                        result = run_with_timeout(run_r_code, [r_code], timeout=timeout)
+                    # Check if the code is a Bash script or CLI command
+                    elif (
+                        code.strip().startswith("#!BASH")
+                        or code.strip().startswith("# Bash script")
+                        or code.strip().startswith("#!CLI")
+                    ):
+                        # Handle both Bash scripts and CLI commands with the same function
+                        if code.strip().startswith("#!CLI"):
+                            # For CLI commands, extract the command and run it as a simple bash script
+                            cli_command = re.sub(r"^#!CLI", "", code, count=1).strip()
+                            # Remove any newlines to ensure it's a single command
+                            cli_command = cli_command.replace("\n", " ")
+                            result = run_with_timeout(run_bash_script, [cli_command], timeout=timeout)
+                        else:
+                            # For Bash scripts, remove the marker and run as a bash script
+                            bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, count=1).strip()
+                            result = run_with_timeout(run_bash_script, [bash_script], timeout=timeout)
+                    # Otherwise, run as Python code
                     else:
-                        # For Bash scripts, remove the marker and run as a bash script
-                        bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, count=1).strip()
-                        result = run_with_timeout(run_bash_script, [bash_script], timeout=timeout)
-                # Otherwise, run as Python code
-                else:
-                    # Clear any previous plots before execution
-                    self._clear_execution_plots()
+                        # Clear any previous plots before execution
+                        self._clear_execution_plots()
 
-                    # Inject custom functions into the Python execution environment
-                    self._inject_custom_functions_to_repl()
-                    result = run_with_timeout(run_python_repl, [code], timeout=timeout)
+                        # Inject custom functions into the Python execution environment
+                        self._inject_custom_functions_to_repl()
+                        result = run_with_timeout(run_python_repl, [code], timeout=timeout)
 
-                    # Plots are now captured directly in the execution entry above
+                        # Plots are now captured directly in the execution entry above
 
-                if len(result) > 10000:
-                    result = (
-                        "The output is too long to be added to context. Here are the first 10K characters...\n"
-                        + result[:10000]
-                    )
+                    if len(result) > 10000:
+                        result = (
+                            "The output is too long to be added to context. Here are the first 10K characters...\n"
+                            + result[:10000]
+                        )
 
-                # Store the execution result with the triggering message
-                if not hasattr(self, "_execution_results"):
-                    self._execution_results = []
+                    # Store the execution result with the triggering message
+                    if not hasattr(self, "_execution_results"):
+                        self._execution_results = []
 
-                # Get any plots that were generated during this execution
-                execution_plots = []
-                try:
-                    from biomni.tool.support_tools import get_captured_plots
-
-                    current_plots = get_captured_plots()
-                    execution_plots = current_plots.copy()
-                except Exception as e:
-                    print(f"Warning: Could not capture plots from execution: {e}")
+                    # Get any plots that were generated during this execution
                     execution_plots = []
+                    try:
+                        from biomni.tool.support_tools import get_captured_plots
 
-                # Store the execution result with metadata
-                execution_entry = {
-                    "triggering_message": last_message,  # The AI message that contained <execute>
-                    "images": execution_plots,  # Base64 encoded images from this execution
-                    "timestamp": datetime.now().isoformat(),
-                }
-                self._execution_results.append(execution_entry)
+                        current_plots = get_captured_plots()
+                        execution_plots = current_plots.copy()
+                    except Exception as e:
+                        print(f"Warning: Could not capture plots from execution: {e}")
+                        execution_plots = []
 
-                observation = f"\n<observation>{result}</observation>"
+                    # Store the execution result with metadata
+                    execution_entry = {
+                        "triggering_message": last_message,  # The AI message that contained <execute>
+                        "images": execution_plots,  # Base64 encoded images from this execution
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                    self._execution_results.append(execution_entry)
+
+                    observation = f"\n<observation>{result}</observation>"
+                    state["messages"].append(AIMessage(content=observation.strip()))
+            except Exception as e:
+                error_msg = f"Error during code execution: {str(e)}"
+                print(f"Execute node error: {error_msg}")
+                traceback.print_exc()
+                observation = f"\n<observation>{error_msg}</observation>"
                 state["messages"].append(AIMessage(content=observation.strip()))
 
             return state
@@ -1776,12 +1796,21 @@ Each library is listed with its description to help you understand its functiona
 
         # Store the final conversation state for markdown generation
         final_state = None
+        message = None
 
-        for s in self.app.stream(inputs, stream_mode="values", config=config):
-            message = s["messages"][-1]
-            out = pretty_print(message)
-            self.log.append(out)
-            final_state = s  # Store the latest state
+        try:
+            for s in self.app.stream(inputs, stream_mode="values", config=config):
+                message = s["messages"][-1]
+                out = pretty_print(message)
+                self.log.append(out)
+                final_state = s  # Store the latest state
+        except Exception as e:
+            error_msg = f"Workflow error: {str(e)}"
+            print(f"Error during agent execution: {error_msg}")
+            traceback.print_exc()
+            self.log.append(f"Error: {error_msg}")
+            if message is None:
+                message = AIMessage(content=f"An error occurred during execution: {error_msg}. Please try again.")
 
         # Store the conversation state for markdown generation
         self._conversation_state = final_state
@@ -1814,14 +1843,21 @@ Each library is listed with its description to help you understand its functiona
         # Store the final conversation state for markdown generation
         final_state = None
 
-        for s in self.app.stream(inputs, stream_mode="values", config=config):
-            message = s["messages"][-1]
-            out = pretty_print(message)
-            self.log.append(out)
-            final_state = s  # Store the latest state
+        try:
+            for s in self.app.stream(inputs, stream_mode="values", config=config):
+                message = s["messages"][-1]
+                out = pretty_print(message)
+                self.log.append(out)
+                final_state = s  # Store the latest state
 
-            # Yield the current step
-            yield {"output": out}
+                # Yield the current step
+                yield {"output": out}
+        except Exception as e:
+            error_msg = f"Workflow error: {str(e)}"
+            print(f"Error during agent execution: {error_msg}")
+            traceback.print_exc()
+            self.log.append(f"Error: {error_msg}")
+            yield {"output": f"Error: {error_msg}"}
 
         # Store the conversation state for markdown generation
         self._conversation_state = final_state
@@ -2733,173 +2769,196 @@ Each library is listed with its description to help you understand its functiona
             code_execution_messages = []
 
             # Stream the agent's responses
-            for s in self.app.stream(inputs, stream_mode="values", config=config):
-                t_step = time() - t
-                message = s["messages"][-1]
+            s = None
+            try:
+                for s in self.app.stream(inputs, stream_mode="values", config=config):
+                    t_step = time() - t
+                    message = s["messages"][-1]
 
-                # Skip the first message which is the input task
-                if message.content == text_input:
-                    t = time()
-                    continue
+                    # Skip the first message which is the input task
+                    if message.content == text_input:
+                        t = time()
+                        continue
 
-                # Process the message
-                if isinstance(message.content, str):
-                    # Extract thinking/reasoning part (text before any tags)
-                    tag_positions = []
-                    for tag in ["<execute>", "<solution>", "<observation>"]:
-                        pos = message.content.find(tag)
-                        if pos != -1:
-                            tag_positions.append(pos)
+                    # Process the message
+                    if isinstance(message.content, str):
+                        # Extract thinking/reasoning part (text before any tags)
+                        tag_positions = []
+                        for tag in ["<execute>", "<solution>", "<observation>"]:
+                            pos = message.content.find(tag)
+                            if pos != -1:
+                                tag_positions.append(pos)
 
-                    # If there are tags, extract the text before the first tag
-                    if tag_positions:
-                        first_tag_pos = min(tag_positions)
-                        thinking = message.content[:first_tag_pos].strip()
-                        if thinking:
+                        # If there are tags, extract the text before the first tag
+                        if tag_positions:
+                            first_tag_pos = min(tag_positions)
+                            thinking = message.content[:first_tag_pos].strip()
+                            if thinking:
+                                inner_history.append(
+                                    ChatMessage(
+                                        role="assistant",
+                                        content=f"{thinking}",
+                                        metadata={"title": "🤔 Reasoning", "log": "Agent's thinking process"},
+                                    )
+                                )
+                                yield inner_history, main_history
+
+                        # Check for solution tag
+                        solution_match = re.search(r"<solution>(.*?)</solution>", message.content, re.DOTALL)
+                        if solution_match and not solution_found:
+                            solution = solution_match.group(1).strip()
+                            main_history.append(
+                                ChatMessage(
+                                    role="assistant",
+                                    content=solution,
+                                    metadata={"title": "✅ Answer", "log": "Final answer provided by the agent"},
+                                )
+                            )
+                            self.main_history_copy += [{"role": "assistant", "content": solution}]
+                            solution_found = True
+                            yield inner_history, main_history
+
+                        # Check for execute tag
+                        execute_match = re.search(r"<execute>(.*?)</execute>", message.content, re.DOTALL)
+                        if execute_match:
+                            code = execute_match.group(1).strip()
+                            language = "python"
+                            if code.strip().startswith("#!R"):
+                                language = "r"
+                                code = re.sub(r"^#!R", "", code, count=1).strip()
+                            elif code.strip().startswith("#!BASH") or code.strip().startswith("#!CLI"):
+                                language = "bash"
+                                code = re.sub(r"^#!BASH|^#!CLI", "", code, count=1).strip()
+
+                            code_msg = ChatMessage(
+                                role="assistant",
+                                content=f"##### Code: \n```{language}\n{code}\n```",
+                                metadata={
+                                    "title": "🛠️ Executing code...",
+                                    "log": f"Executing {language.capitalize()} code block...",
+                                    "status": "pending",
+                                    "start_time": t,
+                                },
+                            )
+                            inner_history.append(code_msg)
+                            code_execution_messages.append(code_msg)
+                            yield inner_history, main_history
+
+                        # Check for observation
+                        observation_match = re.search(r"<observation>(.*?)</observation>", message.content, re.DOTALL)
+                        if observation_match:
+                            observation = observation_match.group(1).strip()
+
+                            # Update the status of the most recent code execution message
+                            if code_execution_messages:
+                                code_msg = code_execution_messages[-1]
+                                code_msg.metadata.update(
+                                    {
+                                        "status": "done",
+                                        "duration": t_step,
+                                        "log": f"Code execution completed in {t_step:.2f}s",
+                                    }
+                                )
+
+                            # Create a new message for the observation
                             inner_history.append(
                                 ChatMessage(
                                     role="assistant",
-                                    content=f"{thinking}",
-                                    metadata={"title": "🤔 Reasoning", "log": "Agent's thinking process"},
+                                    content=f"##### Observation: \n```\n{observation}\n```",
+                                    metadata={
+                                        "status": "done",
+                                        "duration": t_step,
+                                        "log": "Observation from code execution",
+                                        "collapsed": True,
+                                        "collapsible": True,
+                                    },
                                 )
                             )
                             yield inner_history, main_history
 
-                    # Check for solution tag
-                    solution_match = re.search(r"<solution>(.*?)</solution>", message.content, re.DOTALL)
-                    if solution_match and not solution_found:
-                        solution = solution_match.group(1).strip()
-                        main_history.append(
-                            ChatMessage(
-                                role="assistant",
-                                content=solution,
-                                metadata={"title": "✅ Answer", "log": "Final answer provided by the agent"},
-                            )
-                        )
-                        self.main_history_copy += [{"role": "assistant", "content": solution}]
-                        solution_found = True
-                        yield inner_history, main_history
+                            # Check for file paths in the observation
+                            if isinstance(observation, str) and any(ext in observation for ext in SUPPORTED_EXTENSIONS):
+                                matches = re.findall(r"(\S+?(?:\.png|\.jpg|\.jpeg|\.gif|\.bmp|\.webp|\.pdf))", observation)
 
-                    # Check for execute tag
-                    execute_match = re.search(r"<execute>(.*?)</execute>", message.content, re.DOTALL)
-                    if execute_match:
-                        code = execute_match.group(1).strip()
-                        language = "python"
-                        if code.strip().startswith("#!R"):
-                            language = "r"
-                            code = re.sub(r"^#!R", "", code, count=1).strip()
-                        elif code.strip().startswith("#!BASH") or code.strip().startswith("#!CLI"):
-                            language = "bash"
-                            code = re.sub(r"^#!BASH|^#!CLI", "", code, count=1).strip()
-
-                        code_msg = ChatMessage(
-                            role="assistant",
-                            content=f"##### Code: \n```{language}\n{code}\n```",
-                            metadata={
-                                "title": "🛠️ Executing code...",
-                                "log": f"Executing {language.capitalize()} code block...",
-                                "status": "pending",
-                                "start_time": t,
-                            },
-                        )
-                        inner_history.append(code_msg)
-                        code_execution_messages.append(code_msg)
-                        yield inner_history, main_history
-
-                    # Check for observation
-                    observation_match = re.search(r"<observation>(.*?)</observation>", message.content, re.DOTALL)
-                    if observation_match:
-                        observation = observation_match.group(1).strip()
-
-                        # Update the status of the most recent code execution message
-                        if code_execution_messages:
-                            code_msg = code_execution_messages[-1]
-                            code_msg.metadata.update(
-                                {
-                                    "status": "done",
-                                    "duration": t_step,
-                                    "log": f"Code execution completed in {t_step:.2f}s",
-                                }
-                            )
-
-                        # Create a new message for the observation
-                        inner_history.append(
-                            ChatMessage(
-                                role="assistant",
-                                content=f"##### Observation: \n```\n{observation}\n```",
-                                metadata={
-                                    "status": "done",
-                                    "duration": t_step,
-                                    "log": "Observation from code execution",
-                                    "collapsed": True,
-                                    "collapsible": True,
-                                },
-                            )
-                        )
-                        yield inner_history, main_history
-
-                        # Check for file paths in the observation
-                        if isinstance(observation, str) and any(ext in observation for ext in SUPPORTED_EXTENSIONS):
-                            matches = re.findall(r"(\S+?(?:\.png|\.jpg|\.jpeg|\.gif|\.bmp|\.webp|\.pdf))", observation)
-
-                            valid_matches = []
-                            for match in matches:
-                                if not (
-                                    match.startswith("Warning:") or match.startswith("Error:") or match.startswith("'")
-                                ):
-                                    if not match.startswith("."):
-                                        valid_matches.append(match)
-
-                            if valid_matches:
-                                inner_history.append(
-                                    ChatMessage(
-                                        role="assistant",
-                                        content="",
-                                        metadata={"title": "📁 Files", "log": "Files generated by the agent"},
-                                    )
-                                )
-
-                                for file_path in valid_matches:
-                                    file_path = file_path.strip("\"'").strip()
-
-                                    abs_path = None
-                                    if os.path.isabs(file_path) and os.path.exists(file_path):
-                                        abs_path = file_path
-                                    elif os.path.exists(os.path.join(os.getcwd(), file_path)):
-                                        abs_path = os.path.join(os.getcwd(), file_path)
-                                    elif (
-                                        hasattr(self, "path")
-                                        and self.path
-                                        and os.path.exists(os.path.join(self.path, file_path))
+                                valid_matches = []
+                                for match in matches:
+                                    if not (
+                                        match.startswith("Warning:") or match.startswith("Error:") or match.startswith("'")
                                     ):
-                                        abs_path = os.path.join(self.path, file_path)
+                                        if not match.startswith("."):
+                                            valid_matches.append(match)
 
-                                    if abs_path:
-                                        if file_path.lower().endswith(".pdf"):
-                                            inner_history.append(
-                                                ChatMessage(
-                                                    role="assistant",
-                                                    content=f"Found PDF at: {abs_path}",
-                                                    metadata={"title": "📄 PDF File"},
+                                if valid_matches:
+                                    inner_history.append(
+                                        ChatMessage(
+                                            role="assistant",
+                                            content="",
+                                            metadata={"title": "📁 Files", "log": "Files generated by the agent"},
+                                        )
+                                    )
+
+                                    for file_path in valid_matches:
+                                        file_path = file_path.strip("\"'").strip()
+
+                                        abs_path = None
+                                        if os.path.isabs(file_path) and os.path.exists(file_path):
+                                            abs_path = file_path
+                                        elif os.path.exists(os.path.join(os.getcwd(), file_path)):
+                                            abs_path = os.path.join(os.getcwd(), file_path)
+                                        elif (
+                                            hasattr(self, "path")
+                                            and self.path
+                                            and os.path.exists(os.path.join(self.path, file_path))
+                                        ):
+                                            abs_path = os.path.join(self.path, file_path)
+
+                                        if abs_path:
+                                            if file_path.lower().endswith(".pdf"):
+                                                inner_history.append(
+                                                    ChatMessage(
+                                                        role="assistant",
+                                                        content=f"Found PDF at: {abs_path}",
+                                                        metadata={"title": "📄 PDF File"},
+                                                    )
                                                 )
-                                            )
-                                        else:
-                                            inner_history.append(
-                                                ChatMessage(
-                                                    role="assistant",
-                                                    content=gr.Image(abs_path),
-                                                    metadata={"title": "🖼️ Image Preview"},
+                                            else:
+                                                inner_history.append(
+                                                    ChatMessage(
+                                                        role="assistant",
+                                                        content=gr.Image(abs_path),
+                                                        metadata={"title": "🖼️ Image Preview"},
+                                                    )
                                                 )
-                                            )
 
-                                yield inner_history, main_history
+                                    yield inner_history, main_history
 
-                t = time()
+                    t = time()
+
+            except Exception as e:
+                error_msg = f"Workflow error: {str(e)}"
+                print(f"Gradio streaming error: {error_msg}")
+                traceback.print_exc()
+                inner_history.append(
+                    ChatMessage(
+                        role="assistant",
+                        content=f"⚠️ An error occurred during execution: {error_msg}",
+                        metadata={"title": "❌ Error"},
+                    )
+                )
+                main_history.append(
+                    ChatMessage(
+                        role="assistant",
+                        content=f"An error occurred during execution: {error_msg}. Please try again.",
+                        metadata={"title": "❌ Error"},
+                    )
+                )
+                self.main_history_copy += [{"role": "assistant", "content": f"Error: {error_msg}"}]
+                yield inner_history, main_history
 
             # If no solution was found, add the final message
             if not solution_found:
-                final_message = s["messages"][-1].content if s["messages"] else ""
-                solution_match = re.search(r"<solution>(.*?)</solution>", final_message, re.DOTALL)
+                final_message = s["messages"][-1].content if s and s.get("messages") else ""
+                solution_match = re.search(r"<solution>(.*?)</solution>", final_message, re.DOTALL) if final_message else None
                 if solution_match:
                     solution = solution_match.group(1).strip()
                     main_history.append(
@@ -2907,11 +2966,11 @@ Each library is listed with its description to help you understand its functiona
                     )
                     self.main_history_copy += [{"role": "assistant", "content": solution}]
                 else:
-                    cleaned_content = re.sub(r"<execute>.*?</execute>", "", final_message, flags=re.DOTALL)
-                    cleaned_content = re.sub(r"<observation>.*?</observation>", "", cleaned_content, flags=re.DOTALL)
-                    cleaned_content = re.sub(r"\n\s*\n", "\n\n", cleaned_content)
+                    cleaned_content = re.sub(r"<execute>.*?</execute>", "", final_message, flags=re.DOTALL) if final_message else ""
+                    cleaned_content = re.sub(r"<observation>.*?</observation>", "", cleaned_content, flags=re.DOTALL) if cleaned_content else ""
+                    cleaned_content = re.sub(r"\n\s*\n", "\n\n", cleaned_content) if cleaned_content else ""
 
-                    if cleaned_content.strip():
+                    if cleaned_content and cleaned_content.strip():
                         main_history.append(
                             ChatMessage(
                                 role="assistant", content=cleaned_content.strip(), metadata={"title": "📝 Summary"}
