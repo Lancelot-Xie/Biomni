@@ -3202,6 +3202,13 @@ Each library is listed with its description to help you understand its functiona
 
                 main_chatbot.like(like)
 
+            # Reload history list on every page load / browser refresh
+            demo.load(
+                refresh_history_list,
+                None,
+                [history_radio],
+            )
+
         # Launch
         print(f"Launching Gradio demo on {server_name}:7860")
         demo.launch(share=share, server_name=server_name)
